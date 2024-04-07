@@ -237,7 +237,6 @@ impl Store for DedupStore {
         if length == Some(0) {
             writer
                 .send_eof()
-                .await
                 .err_tip(|| "Failed to write EOF out from get_part dedup")?;
             return Ok(());
         }
@@ -350,7 +349,6 @@ impl Store for DedupStore {
         // Finish our stream by writing our EOF and shutdown the stream.
         writer
             .send_eof()
-            .await
             .err_tip(|| "Failed to write EOF out from get_part dedup")?;
         Ok(())
     }

@@ -272,7 +272,7 @@ mod memory_store_tests {
                 .err_tip(|| "Failed to get_part_ref");
         }));
 
-        let file_data = DropCloserReadHalf::take(&mut reader, 1024)
+        let file_data = DropCloserReadHalf::consume(&mut reader, 1024)
             .await
             .err_tip(|| "Error reading bytes")?;
 

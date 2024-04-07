@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -22,7 +23,7 @@ use std::{cmp, env};
 
 use async_trait::async_trait;
 use aws_config::default_provider::credentials;
-use aws_config::BehaviorVersion;
+use aws_config::{AppName, BehaviorVersion};
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -32,21 +33,26 @@ use aws_sdk_s3::types::builders::{CompletedMultipartUploadBuilder, CompletedPart
 use aws_sdk_s3::Client;
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
 use futures::stream::{unfold, FuturesUnordered};
-use futures::{try_join, FutureExt, StreamExt, TryStreamExt};
-use hyper::client::connect::HttpConnector;
+use futures::{try_join, FutureExt, Stream, StreamExt, TryStreamExt};
+use http_body::SizeHint;
+use hyper::client::connect::{Connected, Connection, HttpConnector};
 use hyper::service::Service;
 use hyper::Uri;
 use hyper_rustls::{HttpsConnector, MaybeHttpsStream};
-use nativelink_error::{error_if, make_err, make_input_err, Code, Error, ResultExt};
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_error::{make_err, make_input_err, Code, Error, ResultExt};
+use nativelink_util::buf_channel::{
+    make_buf_channel_pair, DropCloserReadHalf, DropCloserWriteHalf,
+};
 use nativelink_util::common::DigestInfo;
+use nativelink_util::fs;
 use nativelink_util::health_utils::{default_health_status_indicator, HealthStatusIndicator};
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{Store, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, SemaphorePermit};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
@@ -60,6 +66,55 @@ const MIN_MULTIPART_SIZE: usize = 5 * 1024 * 1024; // 5mb.
 // Default limit for concurrent part uploads per multipart upload.
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS: usize = 10;
+
+pub struct ConnectionWithPermit<T: Connection + AsyncRead + AsyncWrite + Unpin> {
+    connection: T,
+    _permit: SemaphorePermit<'static>,
+}
+
+impl<T: Connection + AsyncRead + AsyncWrite + Unpin> Connection for ConnectionWithPermit<T> {
+    fn connected(&self) -> Connected {
+        self.connection.connected()
+    }
+}
+
+impl<T: Connection + AsyncRead + AsyncWrite + Unpin> AsyncRead for ConnectionWithPermit<T> {
+    #[inline]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), tokio::io::Error>> {
+        Pin::new(&mut Pin::get_mut(self).connection).poll_read(cx, buf)
+    }
+}
+
+impl<T: Connection + AsyncWrite + AsyncRead + Unpin> AsyncWrite for ConnectionWithPermit<T> {
+    #[inline]
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, tokio::io::Error>> {
+        Pin::new(&mut Pin::get_mut(self).connection).poll_write(cx, buf)
+    }
+
+    #[inline]
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), tokio::io::Error>> {
+        Pin::new(&mut Pin::get_mut(self).connection).poll_flush(cx)
+    }
+
+    #[inline]
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), tokio::io::Error>> {
+        Pin::new(&mut Pin::get_mut(self).connection).poll_shutdown(cx)
+    }
+}
 
 #[derive(Clone)]
 pub struct TlsConnector {
@@ -97,10 +152,20 @@ impl TlsConnector {
         }
     }
 
-    async fn call_with_retry(&self, req: &Uri) -> Result<MaybeHttpsStream<TcpStream>, Error> {
+    async fn call_with_retry(
+        &self,
+        req: &Uri,
+    ) -> Result<ConnectionWithPermit<MaybeHttpsStream<TcpStream>>, Error> {
         let retry_stream_fn = unfold(self.connector.clone(), move |mut connector| async move {
+            let _permit = fs::get_permit().await.unwrap();
             match connector.call(req.clone()).await {
-                Ok(stream) => Some((RetryResult::Ok(stream), connector)),
+                Ok(connection) => Some((
+                    RetryResult::Ok(ConnectionWithPermit {
+                        connection,
+                        _permit,
+                    }),
+                    connector,
+                )),
                 Err(e) => Some((
                     RetryResult::Retry(make_err!(
                         Code::Unavailable,
@@ -115,7 +180,7 @@ impl TlsConnector {
 }
 
 impl Service<Uri> for TlsConnector {
-    type Response = MaybeHttpsStream<TcpStream>;
+    type Response = ConnectionWithPermit<MaybeHttpsStream<TcpStream>>;
     type Error = Error;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -131,6 +196,58 @@ impl Service<Uri> for TlsConnector {
         Box::pin(async move { connector_clone.call_with_retry(&req).await })
     }
 }
+
+struct BodyWrapper {
+    reader: DropCloserReadHalf,
+    size_hint: SizeHint,
+    data_received: u64,
+}
+
+impl http_body::Body for BodyWrapper {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let ev = Pin::get_mut(self);
+        let reader = Pin::new(&mut ev.reader);
+        reader.poll_next(cx).map(|opt| {
+            opt.map(|res| {
+                res.map(|v| {
+                    ev.data_received += v.len() as u64;
+                    http_body::Frame::data(v)
+                })
+            })
+        })
+        // match reader.poll_next(cx) {
+
+        //     Poll::Ready(None) => Poll::Ready(None),
+        //     Poll::Pending => Poll::Pending,
+        // }
+    }
+
+    // fn is_end_stream(&self) -> bool {
+    //     println!("End stream");
+    //     false
+    // }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint.clone()
+    }
+}
+
+// impl Drop for BodyWrapper {
+//     fn drop(&mut self) {
+//         if self.size_hint.upper() == Some(0) {
+//             return;
+//         }
+//         // if Some(self.data_received) != self.size_hint.upper() {
+//         //     panic!("Expected to receive {:?} bytes, but got {}", self.size_hint.upper(), self.data_received);
+//         // }
+//     }
+// }
 
 pub struct S3Store {
     s3_client: Arc<Client>,
@@ -157,6 +274,12 @@ impl S3Store {
             let credential_provider = credentials::default_provider().await;
             let mut config_builder = aws_config::defaults(BehaviorVersion::v2023_11_09())
                 .credentials_provider(credential_provider)
+                .app_name(AppName::new("nativelink").expect("valid app name"))
+                .timeout_config(
+                    aws_config::timeout::TimeoutConfig::builder()
+                        .connect_timeout(Duration::from_secs(15))
+                        .build(),
+                )
                 .region(Region::new(Cow::Owned(config.region.clone())))
                 .http_client(http_client);
             // TODO(allada) When aws-sdk supports this env variable we should be able
@@ -284,43 +407,84 @@ impl Store for S3Store {
         // 1 network request for the upload instead of minimum of 3 required for
         // multipart upload requests.
         if max_size < MIN_MULTIPART_SIZE {
-            let (body, content_length) = if let UploadSizeInfo::ExactSize(sz) = upload_size {
-                reader.set_close_after_size(sz as u64);
-                (
-                    ByteStream::new(SdkBody::from(
-                        DropCloserReadHalf::take(&mut reader, sz)
-                            .await
-                            .err_tip(|| "Failed to take {sz} bytes from reader in S3")?,
-                    )),
-                    sz as i64,
-                )
-            } else {
-                let write_buf = DropCloserReadHalf::take(&mut reader, max_size + 1) // Just in case, we want to capture the EOF, so +1.
-                    .await
-                    .err_tip(|| "Failed to read file in upload to s3 in single chunk")?;
-                error_if!(
-                    write_buf.len() > max_size,
-                    "More data than provided max_size in s3_store {}",
-                    digest.hash_str()
-                );
-                let content_length = write_buf.len();
-                (
-                    ByteStream::new(SdkBody::from(write_buf)),
-                    content_length as i64,
-                )
-            };
-
             return self
-                .s3_client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(s3_path.clone())
-                .content_length(content_length)
-                .body(body)
-                .send()
-                .await
-                .map_or_else(|e| Err(make_err!(Code::Internal, "{e:?}")), |_| Ok(()))
-                .err_tip(|| "Failed to upload file to s3 in single chunk");
+                .retrier
+                .retry(unfold(reader, move |mut reader| async move {
+                    let count = Arc::new(AtomicU32::new(0));
+                    let count_clone = count.clone();
+                    let (body, content_length, read_fut) =
+                        if let UploadSizeInfo::ExactSize(sz) = upload_size {
+                            let (mut tx, rx) = make_buf_channel_pair();
+                            let body_wrapper = BodyWrapper {
+                                reader: rx,
+                                size_hint: SizeHint::with_exact(sz as u64),
+                                data_received: 0,
+                            };
+                            (
+                                // ByteStream::from_body_0_4(body_wrapper),
+                                ByteStream::from_body_1_x(body_wrapper),
+                                sz as i64,
+                                async move {
+                                    (
+                                        tx.bind(&mut reader)
+                                            .await
+                                            .err_tip(|| "in S3Store::update()"),
+                                        reader,
+                                    )
+                                },
+                            )
+                        } else {
+                            unreachable!();
+                            // let write_buf = DropCloserReadHalf::consume(&mut reader, max_size + 1) // Just in case, we want to capture the EOF, so +1.
+                            //     .await
+                            //     .err_tip(|| "Failed to read file in upload to s3 in single chunk")?;
+                            // error_if!(
+                            //     write_buf.len() > max_size,
+                            //     "More data than provided max_size in s3_store {}",
+                            //     digest.hash_str()
+                            // );
+                            // let content_length = write_buf.len();
+                            // (
+                            //     ByteStream::new(SdkBody::from(write_buf)),
+                            //     content_length as i64,
+                            // )
+                        };
+
+                    let (upload_result, (read_fut_result, reader)) = tokio::join!(
+                        self.s3_client
+                            .put_object()
+                            .bucket(&self.bucket)
+                            .key(s3_path.clone())
+                            .content_length(content_length)
+                            .body(body)
+                            .send(),
+                        read_fut
+                    );
+                    let v = read_fut_result.merge(
+                        upload_result
+                            .map_or_else(|e| Err(make_err!(Code::Unavailable, "{e:?}")), |_| Ok(()))
+                            .err_tip(|| "Failed to upload file to s3 in single chunk"),
+                    );
+                    match v {
+                        Ok(()) => {
+                            return Some((RetryResult::Ok(()), reader));
+                        }
+                        Err(e) => {
+                            if reader.get_bytes_received() == 0 {
+                                return Some((RetryResult::Retry(e), reader));
+                            }
+                            let e = e
+                                .clone()
+                                .append(format!("Bytes received: {}", reader.get_bytes_received()))
+                                .append(format!(
+                                    "Count: {}",
+                                    count_clone.load(std::sync::atomic::Ordering::Acquire)
+                                ));
+                            return Some((RetryResult::Err(e), reader));
+                        }
+                    }
+                }))
+                .await;
         }
 
         // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
@@ -356,7 +520,7 @@ impl Store for S3Store {
 
             let read_stream_fut = async move {
                 loop {
-                    let write_buf = DropCloserReadHalf::take(&mut reader, bytes_per_upload_part)
+                    let write_buf = DropCloserReadHalf::consume(&mut reader, bytes_per_upload_part)
                         .await
                         .err_tip(|| "Failed to read chunk in s3_store")?;
                     if write_buf.is_empty() {
@@ -461,7 +625,6 @@ impl Store for S3Store {
         if is_zero_digest(&digest) {
             writer
                 .send_eof()
-                .await
                 .err_tip(|| "Failed to send zero EOF in filesystem store get_part_ref")?;
             return Ok(());
         }
@@ -470,11 +633,6 @@ impl Store for S3Store {
         let end_read_byte = length
             .map_or(Some(None), |length| Some(offset.checked_add(length)))
             .err_tip(|| "Integer overflow protection triggered")?;
-
-        // S3 drops connections when a stream is done. This means that we can't
-        // run the EOF error check. It's safe to disable it since S3 can be
-        // trusted to handle incomplete data properly.
-        writer.set_ignore_eof();
 
         self.retrier
             .retry(unfold(writer, move |writer| async move {
@@ -543,7 +701,7 @@ impl Store for S3Store {
                         }
                     }
                 }
-                if let Err(e) = writer.send_eof().await {
+                if let Err(e) = writer.send_eof() {
                     return Some((
                         RetryResult::Err(make_input_err!(
                             "Failed to send EOF to consumer in S3: {e}"

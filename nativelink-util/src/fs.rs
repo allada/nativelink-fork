@@ -290,7 +290,7 @@ pub static OPEN_FILE_SEMAPHORE: Semaphore = Semaphore::const_new(DEFAULT_OPEN_FI
 /// This function will block, so it must be run from a thread that
 /// can be blocked.
 #[inline]
-async fn get_permit() -> Result<SemaphorePermit<'static>, Error> {
+pub async fn get_permit() -> Result<SemaphorePermit<'static>, Error> {
     OPEN_FILE_SEMAPHORE
         .acquire()
         .await
@@ -308,6 +308,18 @@ where
         .await
         .unwrap_or_else(|e| Err(make_err!(Code::Internal, "background task failed: {e:?}")))
 }
+
+// /// Acquire a permit from the open file semaphore and call a raw function.
+// #[inline]
+// pub async fn future_with_permit<F, Fut, T>(f: F) -> Result<T, Error>
+// where
+//     F: FnOnce(SemaphorePermit<'static>) -> Fut,
+//     Fut: Future<Output = T> + Send,
+//     T: Send,
+// {
+//     let permit = get_permit().await?;
+//     Ok(f(permit).await)
+// }
 
 pub fn set_open_file_limit(limit: usize) {
     let current_total = TOTAL_FILE_SEMAPHORES.load(Ordering::Acquire);

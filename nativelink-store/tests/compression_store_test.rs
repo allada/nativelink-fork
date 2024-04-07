@@ -288,7 +288,7 @@ mod compression_store_tests {
         let (mut tx, rx) = make_buf_channel_pair();
         let send_fut = async move {
             tx.send(RAW_INPUT.into()).await?;
-            tx.send_eof().await
+            tx.send_eof()
         };
         let (res1, res2) = futures::join!(
             send_fut,
@@ -533,7 +533,7 @@ mod compression_store_tests {
                 .err_tip(|| "Failed to get_part_ref");
         }));
 
-        let file_data = DropCloserReadHalf::take(&mut reader, 1024)
+        let file_data = DropCloserReadHalf::consume(&mut reader, 1024)
             .await
             .err_tip(|| "Error reading bytes")?;
 

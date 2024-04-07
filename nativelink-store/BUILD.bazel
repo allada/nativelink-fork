@@ -49,6 +49,8 @@ rust_library(
         "@crates//:filetime",
         "@crates//:futures",
         "@crates//:hex",
+        "@crates//:http",
+        "@crates//:http-body",
         "@crates//:hyper",
         "@crates//:hyper-rustls",
         "@crates//:lz4_flex",

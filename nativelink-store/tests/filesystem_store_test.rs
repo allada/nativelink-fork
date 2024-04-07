@@ -49,8 +49,9 @@ use tokio::time::sleep;
 use tokio_stream::wrappers::ReadDirStream;
 use tokio_stream::StreamExt;
 
+#[async_trait]
 trait FileEntryHooks {
-    fn on_unref<Fe: FileEntry>(_entry: &Fe) {}
+    async fn on_unref<Fe: FileEntry>(_entry: &Fe) {}
     fn on_drop<Fe: FileEntry>(_entry: &Fe) {}
 }
 
@@ -151,7 +152,7 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> LenEntry for TestFileEntry<H
     }
 
     async fn unref(&self) {
-        Hooks::on_unref(self);
+        Hooks::on_unref(self).await;
         self.inner.as_ref().unwrap().unref().await
     }
 }
@@ -228,8 +229,8 @@ mod filesystem_store_tests {
 
     const HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
     const HASH2: &str = "0123456789abcdef000000000000000000020000000000000123456789abcdef";
-    const VALUE1: &str = "123";
-    const VALUE2: &str = "321";
+    const VALUE1: &str = "12345";
+    const VALUE2: &str = "54321";
 
     #[tokio::test]
     async fn valid_results_after_shutdown_test() -> Result<(), Error> {
@@ -422,7 +423,7 @@ mod filesystem_store_tests {
 
         {
             // Check to ensure our first byte has been received. The future should be stalled here.
-            let first_byte = DropCloserReadHalf::take(&mut reader, 1)
+            let first_byte = DropCloserReadHalf::consume(&mut reader, 1)
                 .await
                 .err_tip(|| "Error reading first byte")?;
             assert_eq!(
@@ -465,7 +466,7 @@ mod filesystem_store_tests {
             );
         }
 
-        let remaining_file_data = DropCloserReadHalf::take(&mut reader, 1024)
+        let remaining_file_data = DropCloserReadHalf::consume(&mut reader, 1024)
             .await
             .err_tip(|| "Error reading remaining bytes")?;
 
@@ -582,7 +583,7 @@ mod filesystem_store_tests {
             );
         }
 
-        let reader_data = DropCloserReadHalf::take(&mut reader, 1024)
+        let reader_data = DropCloserReadHalf::consume(&mut reader, 1024)
             .await
             .err_tip(|| "Error reading remaining bytes")?;
 
@@ -826,16 +827,20 @@ mod filesystem_store_tests {
 
         static UNREFED_DIGESTS: Lazy<Mutex<Vec<DigestInfo>>> = Lazy::new(|| Mutex::new(Vec::new()));
         struct LocalHooks {}
+        #[async_trait]
         impl FileEntryHooks for LocalHooks {
-            fn on_unref<Fe: FileEntry>(file_entry: &Fe) {
-                block_on(file_entry.get_file_path_locked(move |path_str| async move {
-                    let path = Path::new(&path_str);
-                    let digest =
-                        digest_from_filename(path.file_name().unwrap().to_str().unwrap()).unwrap();
-                    UNREFED_DIGESTS.lock().unwrap().push(digest);
-                    Ok(())
-                }))
-                .unwrap();
+            async fn on_unref<Fe: FileEntry>(file_entry: &Fe) {
+                file_entry
+                    .get_file_path_locked(move |path_str| async move {
+                        let path = Path::new(&path_str);
+                        let digest =
+                            digest_from_filename(path.file_name().unwrap().to_str().unwrap())
+                                .unwrap();
+                        UNREFED_DIGESTS.lock().unwrap().push(digest);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
             }
         }
 
@@ -845,7 +850,7 @@ mod filesystem_store_tests {
                     content_path: make_temp_path("content_path"),
                     temp_path: make_temp_path("temp_path"),
                     eviction_policy: Some(nativelink_config::stores::EvictionPolicy {
-                        max_bytes: 5,
+                        max_bytes: 7,
                         ..Default::default()
                     }),
                     block_size: 1,
@@ -981,7 +986,7 @@ mod filesystem_store_tests {
 
         // Because send_eof() waits for shutdown of the rx side, we cannot just await in this thread.
         tokio::spawn(async move {
-            tx.send_eof().await.unwrap();
+            tx.send_eof().unwrap();
         });
 
         // Now finish waiting on update(). This should reuslt in an error because we deleted our dest
@@ -1054,7 +1059,7 @@ mod filesystem_store_tests {
                 .await
         }));
 
-        let file_data = DropCloserReadHalf::take(&mut reader, 1024)
+        let file_data = DropCloserReadHalf::consume(&mut reader, 1024)
             .await
             .err_tip(|| "Error reading bytes")?;
 
@@ -1100,7 +1105,7 @@ mod filesystem_store_tests {
                 .err_tip(|| "Failed to get_part_ref");
         }));
 
-        let file_data = DropCloserReadHalf::take(&mut reader, 1024)
+        let file_data = DropCloserReadHalf::consume(&mut reader, 1024)
             .await
             .err_tip(|| "Error reading bytes")?;
 

@@ -53,58 +53,13 @@ mod buf_channel_tests {
         let tx_fut = async move {
             tx.send(DATA1.into()).await?;
             assert_eq!(tx.is_pipe_broken(), false);
-            tx.send_eof().await?;
+            tx.send_eof()?;
             assert_eq!(tx.is_pipe_broken(), true);
             Result::<(), Error>::Ok(())
         };
         let rx_fut = async move {
             assert_eq!(rx.recv().await?, Bytes::from(DATA1));
             assert_eq!(rx.recv().await?, Bytes::new());
-            Result::<(), Error>::Ok(())
-        };
-        try_join!(tx_fut, rx_fut)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rx_closes_before_eof_sends_err_to_tx_test() -> Result<(), Error> {
-        let (mut tx, mut rx) = make_buf_channel_pair();
-        let tx_fut = async move {
-            // Send one message.
-            tx.send(DATA1.into()).await?;
-            // Try to send EOF, but expect error because receiver will be dropped without taking it.
-            assert_eq!(
-                tx.send_eof().await,
-                Err(make_err!(
-                    Code::Internal,
-                    "Receiver went away before receiving EOF"
-                ))
-            );
-            Result::<(), Error>::Ok(())
-        };
-        let rx_fut = async move {
-            // Receive first message.
-            assert_eq!(rx.recv().await?, Bytes::from(DATA1));
-            // Now drop rx without receiving EOF.
-            Result::<(), Error>::Ok(())
-        };
-        try_join!(tx_fut, rx_fut)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn set_close_after_size_test() -> Result<(), Error> {
-        let (mut tx, mut rx) = make_buf_channel_pair();
-        let tx_fut = async move {
-            tx.send(DATA1.into()).await?;
-            tx.send_eof().await?;
-            Result::<(), Error>::Ok(())
-        };
-        let rx_fut = async move {
-            rx.set_close_after_size(DATA1.len() as u64);
-            assert_eq!(rx.recv().await?, Bytes::from(DATA1));
-            // Now there's an EOF, but we are going to drop instead of taking it.
-            // We should not send an error to the tx.
             Result::<(), Error>::Ok(())
         };
         try_join!(tx_fut, rx_fut)?;
@@ -119,7 +74,7 @@ mod buf_channel_tests {
             tx.send(DATA2.into()).await?;
             tx.send(DATA1.into()).await?;
             tx.send(DATA2.into()).await?;
-            tx.send_eof().await?;
+            tx.send_eof()?;
             Result::<(), Error>::Ok(())
         };
         let rx_fut = async move {
@@ -142,7 +97,7 @@ mod buf_channel_tests {
         let send_data_ptr = sent_data.as_ptr();
         let tx_fut = async move {
             tx.send(sent_data).await?;
-            tx.send_eof().await?;
+            tx.send_eof()?;
             Result::<(), Error>::Ok(())
         };
         let rx_fut = async move {
@@ -164,16 +119,16 @@ mod buf_channel_tests {
             tx.send(DATA2.into()).await?;
             tx.send(DATA1.into()).await?;
             tx.send(DATA2.into()).await?;
-            tx.send_eof().await?;
+            tx.send_eof()?;
             Result::<(), Error>::Ok(())
         };
         let rx_fut = async move {
             let all_data = Bytes::from(format!("{DATA1}{DATA2}{DATA1}{DATA2}"));
-            assert_eq!(rx.take(1).await?, all_data.slice(0..1));
-            assert_eq!(rx.take(3).await?, all_data.slice(1..4));
-            assert_eq!(rx.take(4).await?, all_data.slice(4..8));
+            assert_eq!(rx.consume(1).await?, all_data.slice(0..1));
+            assert_eq!(rx.consume(3).await?, all_data.slice(1..4));
+            assert_eq!(rx.consume(4).await?, all_data.slice(4..8));
             // Last chunk take too much data and expect EOF to be hit.
-            assert_eq!(rx.take(100).await?, all_data.slice(8..12));
+            assert_eq!(rx.consume(100).await?, all_data.slice(8..12));
             Result::<(), Error>::Ok(())
         };
         try_join!(tx_fut, rx_fut)?;
@@ -190,12 +145,12 @@ mod buf_channel_tests {
         let first_chunk_ptr = first_chunk.as_ptr();
         let tx_fut = async move {
             tx.send(first_chunk).await?;
-            tx.send_eof().await?;
+            tx.send_eof()?;
             Result::<(), Error>::Ok(())
         };
         let rx_fut = async move {
-            assert_eq!(rx.take(1).await?.as_ptr(), first_chunk_ptr);
-            assert_eq!(rx.take(100).await?.as_ptr(), unsafe {
+            assert_eq!(rx.consume(1).await?.as_ptr(), first_chunk_ptr);
+            assert_eq!(rx.consume(100).await?.as_ptr(), unsafe {
                 first_chunk_ptr.add(1)
             });
             Result::<(), Error>::Ok(())
@@ -213,7 +168,7 @@ mod buf_channel_tests {
             tx.send(DATA2.into()).await?;
             tx.send(DATA1.into()).await?;
             tx.send(DATA2.into()).await?;
-            tx.send_eof().await?;
+            tx.send_eof()?;
             Result::<(), Error>::Ok(())
         };
         let rx_fut = async move {
@@ -258,15 +213,16 @@ mod buf_channel_tests {
                             tx.send(tx_data.slice(i..std::cmp::min(data_size, i + write_size)))
                                 .await?;
                         }
-                        tx.send_eof().await?;
+                        tx.send_eof()?;
                         Result::<(), Error>::Ok(())
                     };
                     let rx_fut = async move {
                         let mut round_trip_data = BytesMut::new();
                         for _ in (0..data_size).step_by(read_size) {
-                            round_trip_data.extend(rx.take(read_size).await?.iter());
+                            round_trip_data.extend(rx.consume(read_size).await?.iter());
                         }
                         assert_eq!(round_trip_data.freeze(), expected_data);
+                        rx.drain().await?;
                         Result::<(), Error>::Ok(())
                     };
                     try_join!(tx_fut, rx_fut)?;
@@ -287,29 +243,9 @@ mod buf_channel_tests {
             assert_eq!(rx.recv().await?, Bytes::from(DATA1));
             assert_eq!(
                 rx.recv().await,
-                Err(make_err!(Code::Internal, "Received erroneous partial chunk: Error {{ code: Internal, messages: [\"Writer was dropped before EOF was sent\"] }}"))
-            );
-            Result::<(), Error>::Ok(())
-        };
-        try_join!(tx_fut, rx_fut)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rx_accepts_tx_drop_test_when_eof_ignored() -> Result<(), Error> {
-        let (mut tx, mut rx) = make_buf_channel_pair();
-        tx.set_ignore_eof();
-        let tx_fut = async move {
-            tx.send(DATA1.into()).await?;
-            Result::<(), Error>::Ok(())
-        };
-        let rx_fut = async move {
-            assert_eq!(rx.recv().await?, Bytes::from(DATA1));
-            assert_eq!(
-                rx.recv().await,
                 Err(make_err!(
                     Code::Internal,
-                    "Failed to send closing ok message to write"
+                    "EOF received before sending EOF; sender was probably dropped"
                 ))
             );
             Result::<(), Error>::Ok(())

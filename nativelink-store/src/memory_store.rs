@@ -133,7 +133,6 @@ impl Store for MemoryStore {
         if is_zero_digest(&digest) {
             writer
                 .send_eof()
-                .await
                 .err_tip(|| "Failed to send zero EOF in filesystem store get_part_ref")?;
             return Ok(());
         }
@@ -158,7 +157,6 @@ impl Store for MemoryStore {
         }
         writer
             .send_eof()
-            .await
             .err_tip(|| "Failed to write EOF in memory store get_part")?;
         Ok(())
     }

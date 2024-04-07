@@ -311,7 +311,7 @@ impl ByteStreamServer {
             let mut state = state?; // If None our stream is done.
             loop {
                 tokio::select! {
-                    read_result = state.rx.take(state.max_bytes_per_stream) => {
+                    read_result = state.rx.consume(state.max_bytes_per_stream) => {
                         match read_result {
                             Ok(bytes) => {
                                 if bytes.is_empty() {
@@ -355,14 +355,14 @@ impl ByteStreamServer {
                     result = &mut state.get_part_fut => {
                         state.maybe_get_part_result = Some(result);
                         // It is non-deterministic on which future will finish in what order.
-                        // It is also possible that the `state.rx.take()` call above may not be able to
+                        // It is also possible that the `state.rx.consume()` call above may not be able to
                         // respond even though the publishing future is done.
                         // Because of this we set the writing future to pending so it never finishes.
-                        // The `state.rx.take()` future will eventually finish and return either the
+                        // The `state.rx.consume()` future will eventually finish and return either the
                         // data or an error.
-                        // An EOF will terminate the `state.rx.take()` future, but we are also protected
+                        // An EOF will terminate the `state.rx.consume()` future, but we are also protected
                         // because we are dropping the writing future, it will drop the `tx` channel
-                        // which will eventually propagate an error to the `state.rx.take()` future if
+                        // which will eventually propagate an error to the `state.rx.consume()` future if
                         // the EOF was not sent due to some other error.
                         state.get_part_fut = Box::pin(pending());
                     },
@@ -474,7 +474,6 @@ impl ByteStreamServer {
                 if write_request.finish_write {
                     // Gracefully close our stream.
                     tx.send_eof()
-                        .await
                         .err_tip(|| "Failed to send EOF in ByteStream::write")?;
                     return Ok(());
                 }
