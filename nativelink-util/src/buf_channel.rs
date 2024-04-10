@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use futures::task::Context;
 use futures::{Future, Stream, TryFutureExt};
 use nativelink_error::{error_if, make_err, make_input_err, Code, Error, ResultExt};
@@ -79,29 +79,32 @@ impl DropCloserWriteHalf {
             Ok(tx) => tx,
             Err(e) => return Err((e, buf)),
         };
-        let buf_len = buf.len() as u64;
+        let Ok(buf_len) = u64::try_from(buf.len()) else {
+            return Err((
+                make_err!(Code::Internal, "Could not convert usize to u64"),
+                buf,
+            ));
+        };
         if buf_len == 0 {
             return Err((
                 make_input_err!("Cannot send EOF in send(). Instead use send_eof()"),
                 buf,
             ));
         }
-        let result = tx.send(Ok(buf)).await.map_err(|err| {
-            (
+        if let Err(err) = tx.send(Ok(buf)).await {
+            // Close our channel.
+            self.tx = None;
+            return Err((
                 make_err!(
                     Code::Internal,
                     "Failed to write to data, receiver disconnected"
                 ),
                 err.0
                     .expect("Data should never be Err in send_get_bytes_on_error()"),
-            )
-        });
-        if result.is_err() {
-            // Close our channel to prevent drop() from spawning a task.
-            self.tx = None;
+            ));
         }
         self.bytes_written += buf_len;
-        result
+        Ok(())
     }
 
     pub async fn bind(&mut self, reader: &mut DropCloserReadHalf) -> Result<(), Error> {
@@ -235,11 +238,39 @@ impl DropCloserReadHalf {
         self.recent_data.push(chunk.clone());
     }
 
-    // pub fn maybe_reset_stream(&mut self) -> Result<(), Error> {
-    //     // ...
-    //     self.queued_data.extend(0, self.recent_data.drain(..).map(Ok));
-    //     Ok(())
-    // }
+    /// Sets the maximum size of the recent_data buffer. If the number of bytes
+    /// received exceeds this size, the recent_data buffer will be cleared and
+    /// no longer populated.
+    pub fn set_max_recent_data_size(&mut self, size: u64) {
+        self.max_recent_data_size = size;
+    }
+
+    /// Attempts to reset the stream to before any data was received. This will
+    /// only work if the number of bytes received is less than max_recent_data_size.
+    ///
+    /// On error the state of the stream is undefined and the caller should not
+    /// attempt to use the stream again.
+    pub fn try_reset_stream(&mut self) -> Result<(), Error> {
+        if self.bytes_received > self.max_recent_data_size {
+            return Err(make_err!(
+                Code::Internal,
+                "Cannot reset stream, max_recent_data_size exceeded"
+            ));
+        }
+        let mut data_sum = 0;
+        for chunk in self.recent_data.drain(..).rev() {
+            data_sum += chunk.len() as u64;
+            self.queued_data.push_front(Ok(chunk));
+        }
+        assert!(self.recent_data.is_empty(), "Recent_data should be empty");
+        // Ensure the sum of the bytes in recent_data is equal to the bytes_received.
+        error_if!(
+            data_sum != self.bytes_received,
+            "Sum of recent_data bytes does not equal bytes_received"
+        );
+        self.bytes_received = 0;
+        Ok(())
+    }
 
     /// Drains the reader until an EOF is received, but sends data to the void.
     pub async fn drain(&mut self) -> Result<(), Error> {
@@ -260,7 +291,7 @@ impl DropCloserReadHalf {
     pub async fn peek(&mut self) -> &Result<Bytes, Error> {
         if self.queued_data.is_empty() {
             let chunk = self.recv().await;
-            self.queued_data.push_back(chunk);
+            self.queued_data.push_front(chunk);
         }
         self.queued_data
             .front()
@@ -280,11 +311,8 @@ impl DropCloserReadHalf {
             .err_tip(|| "In buf_channel::collect_all_with_size_hint")
     }
 
-    pub fn consume<'a>(
-        &'a mut self,
-        size: usize,
-    ) -> impl Future<Output = Result<Bytes, Error>> + 'a {
-        self.inner_consume(size, 0)
+    pub async fn consume(&mut self, size: usize) -> Result<Bytes, Error> {
+        self.inner_consume(size, 0).await
     }
 
     /// Takes exactly `size` number of bytes from the stream and returns them.
@@ -324,7 +352,7 @@ impl DropCloserReadHalf {
             chunk
         };
         let mut output = BytesMut::with_capacity(size_hint);
-        output.put(first_chunk);
+        output.extend_from_slice(&first_chunk);
 
         loop {
             let mut chunk = self
@@ -339,7 +367,7 @@ impl DropCloserReadHalf {
                 let remaining = chunk.split_off(size - output.len());
                 self.queued_data.push_front(Ok(remaining));
             }
-            output.put(chunk);
+            output.extend_from_slice(&chunk);
             if output.len() == size {
                 break; // We are done.
             }

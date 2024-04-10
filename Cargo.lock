@@ -1860,6 +1860,7 @@ dependencies = [
  "http-body 1.0.0",
  "hyper",
  "hyper-rustls",
+ "log",
  "lz4_flex",
  "memory-stats",
  "nativelink-config",

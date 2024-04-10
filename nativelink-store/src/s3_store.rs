@@ -15,7 +15,6 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -401,6 +400,10 @@ impl Store for S3Store {
         let max_size = match upload_size {
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
         };
+
+        // TODO(allada) FIX THIS BEFORE COMMIT!
+        reader.set_max_recent_data_size(1024 * 128);
+
         // NOTE(blaise.bruer) It might be more optimal to use a different
         // heuristic here, but for simplicity we use a hard coded value.
         // Anything going down this if-statement will have the advantage of only
@@ -410,8 +413,6 @@ impl Store for S3Store {
             return self
                 .retrier
                 .retry(unfold(reader, move |mut reader| async move {
-                    let count = Arc::new(AtomicU32::new(0));
-                    let count_clone = count.clone();
                     let (body, content_length, read_fut) =
                         if let UploadSizeInfo::ExactSize(sz) = upload_size {
                             let (mut tx, rx) = make_buf_channel_pair();
@@ -450,7 +451,7 @@ impl Store for S3Store {
                             // )
                         };
 
-                    let (upload_result, (read_fut_result, reader)) = tokio::join!(
+                    let (upload_result, (read_fut_result, mut reader)) = tokio::join!(
                         self.s3_client
                             .put_object()
                             .bucket(&self.bucket)
@@ -466,21 +467,49 @@ impl Store for S3Store {
                             .err_tip(|| "Failed to upload file to s3 in single chunk"),
                     );
                     match v {
-                        Ok(()) => {
-                            return Some((RetryResult::Ok(()), reader));
-                        }
+                        Ok(()) => Some((RetryResult::Ok(()), reader)),
                         Err(e) => {
-                            if reader.get_bytes_received() == 0 {
-                                return Some((RetryResult::Retry(e), reader));
+                            let bytes_received = reader.get_bytes_received();
+                            match reader.try_reset_stream() {
+                                Ok(_) => {
+                                    log::warn!("Retry did happen with {} bytes received, but was able to reset stream in S3Store::update", bytes_received);
+                                    Some((RetryResult::Retry(e), reader))
+                                },
+                                Err(try_reset_err) => {
+                                    log::error!("Retry did happen with {} bytes received, but unable to reset stream in S3Store::update", bytes_received);
+                                    Some((
+                                        RetryResult::Err(
+                                            e.merge(try_reset_err).append(
+                                                "Unable to retry upload in S3Store::update",
+                                            ),
+                                        ),
+                                        reader,
+                                    ))
+                                    // return Some((
+                                    //     RetryResult::Err(make_err!(
+                                    //         Code::Internal,
+                                    //         "Unable to retry upload in S3Store::update: {e:?}"
+                                    //     )),
+                                    //     reader,
+                                    // ));
+                                }
                             }
-                            let e = e
-                                .clone()
-                                .append(format!("Bytes received: {}", reader.get_bytes_received()))
-                                .append(format!(
-                                    "Count: {}",
-                                    count_clone.load(std::sync::atomic::Ordering::Acquire)
-                                ));
-                            return Some((RetryResult::Err(e), reader));
+                            // if  {
+                            //     return Some((
+                            //         RetryResult::Err(make_err!(
+                            //             Code::Internal,
+                            //             "Unable to retry upload in S3Store::update: {e:?}"
+                            //         )),
+                            //         reader,
+                            //     ));
+                            // }
+                            // if reader.get_bytes_received() == 0 {
+                            //     return ;
+                            // }
+                            // let e = e
+                            //     .clone()
+                            //     .append("Unable to retry upload in S3Store::update: {e:?}");
+                            // Some((RetryResult::Err(e), reader))
                         }
                     }
                 }))
