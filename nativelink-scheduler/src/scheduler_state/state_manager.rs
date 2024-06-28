@@ -40,7 +40,6 @@ use crate::scheduler_state::client_action_state_result::ClientActionStateResult;
 use crate::scheduler_state::completed_action::CompletedAction;
 use crate::scheduler_state::matching_engine_action_state_result::MatchingEngineActionStateResult;
 use crate::scheduler_state::metrics::Metrics;
-use crate::scheduler_state::workers::Workers;
 use crate::worker::WorkerUpdate;
 
 #[repr(transparent)]
@@ -53,7 +52,6 @@ impl StateManager {
     pub(crate) fn new(
         queued_actions_set: HashSet<Arc<ActionInfo>>,
         queued_actions: BTreeMap<Arc<ActionInfo>, AwaitedAction>,
-        workers: Workers,
         active_actions: HashMap<Arc<ActionInfo>, AwaitedAction>,
         recently_completed_actions: HashSet<CompletedAction>,
         metrics: Arc<Metrics>,
@@ -64,7 +62,6 @@ impl StateManager {
             inner: StateManagerImpl {
                 queued_actions_set,
                 queued_actions,
-                workers,
                 active_actions,
                 recently_completed_actions,
                 metrics,
@@ -178,10 +175,6 @@ pub(crate) struct StateManagerImpl {
     ///
     /// Important: `queued_actions_set` and `queued_actions` must be kept in sync.
     pub(crate) queued_actions: BTreeMap<Arc<ActionInfo>, AwaitedAction>,
-
-    /// A `Workers` pool that contains all workers that are available to execute actions in a priority
-    /// order based on the allocation strategy.
-    pub(crate) workers: Workers,
 
     /// A map of all actions that are active. A hashmap is used to find actions that are active in
     /// O(1) time. The key is the `ActionInfo` struct. The value is the `AwaitedAction` struct.
@@ -561,7 +554,7 @@ impl ClientStateManager for StateManager {
 #[async_trait]
 impl WorkerStateManager for StateManager {
     async fn update_operation(
-        &mut self,
+        &self,
         operation_id: OperationId,
         worker_id: WorkerId,
         action_stage: Result<ActionStage, Error>,
@@ -684,23 +677,20 @@ impl MatchingEngineStateManager for StateManager {
         _filter: OperationFilter, // TODO(adam): reference filter
     ) -> Result<ActionStateResultStream, Error> {
         // TODO(adams): use OperationFilter vs directly encoding it.
-        let action_infos: Map<
-            Cloned<Rev<Keys<Arc<ActionInfo>, AwaitedAction>>>,
-            fn(Arc<ActionInfo>) -> Arc<dyn ActionStateResult>,
-        > = self
+        let action_infos = self
             .inner
             .queued_actions
-            .keys()
+            .iter()
             .rev()
-            .cloned()
-            .map(|action_info| {
-                // TODO(adam): ActionState is always available and can be returned from here.
-                //   later we might want to rewrite this to return ActionState.
+            .map(|(action_info, awaited_action)| {
                 let cloned_action_info = action_info.clone();
-                Arc::new(MatchingEngineActionStateResult::new(cloned_action_info))
+                Arc::new(
+                    MatchingEngineActionStateResult::new(cloned_action_info, awaited_action.notify_channel.subscribe())
+                    
+                ) as Arc<dyn ActionStateResult>
             });
 
-        let action_infos: Vec<Arc<dyn ActionStateResult>> = action_infos.collect();
+        let action_infos: Vec<Arc<(dyn ActionStateResult)>> = action_infos.collect();
         Ok(Box::pin(stream::iter(action_infos)))
     }
 

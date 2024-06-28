@@ -16,6 +16,7 @@ use lru::LruCache;
 use nativelink_config::schedulers::WorkerAllocationStrategy;
 use nativelink_error::{error_if, make_input_err, Error, ResultExt};
 use nativelink_util::action_messages::{ActionStage, WorkerId};
+use nativelink_util::platform_properties::{self, PlatformProperties};
 use tracing::{event, Level};
 
 use crate::scheduler_state::awaited_action::AwaitedAction;
@@ -96,13 +97,8 @@ impl Workers {
     // simulation of worst cases in a single threaded environment.
     pub(crate) fn find_worker_for_action(
         &self,
-        awaited_action: &AwaitedAction,
+        action_properties: &PlatformProperties,
     ) -> Option<WorkerId> {
-        assert!(matches!(
-            awaited_action.current_state.stage,
-            ActionStage::Queued
-        ));
-        let action_properties = &awaited_action.action_info.platform_properties;
         let mut workers_iter = self.workers.iter();
         let workers_iter = match self.allocation_strategy {
             // Use rfind to get the least recently used that satisfies the properties.
