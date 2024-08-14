@@ -27,7 +27,7 @@ use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
-    CasConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, ServerConfig, WorkerConfig,
+    CasConfig, ExecutionConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, ServerConfig, WorkerConfig
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{make_err, Code, Error, ResultExt};
@@ -59,6 +59,7 @@ use nativelink_util::store_trait::{
 use nativelink_util::task::TaskExecutor;
 use nativelink_util::{background_spawn, init_tracing, spawn, spawn_blocking};
 use nativelink_worker::local_worker::new_local_worker;
+use nativelink_worker::new_local_worker::NewLocalWorker;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::{Mutex, RwLock};
@@ -909,7 +910,7 @@ async fn inner_main(
                         fast_slow_store.clone()
                     };
                     let (local_worker, metrics) = new_local_worker(
-                        Arc::new(local_worker_cfg),
+                        Arc::new(local_worker_cfg.clone()),
                         fast_slow_store,
                         maybe_ac_store,
                         historical_store,
@@ -932,6 +933,31 @@ async fn inner_main(
                     worker_metrics.insert(name.clone(), metrics);
                     let fut = Arc::new(OriginContext::new())
                         .wrap_async(trace_span!("worker_ctx"), local_worker.run());
+
+                    let cfg = HashMap::<String, ExecutionConfig>::new();
+                    // cfg.insert("".to_string(), ExecutionConfig {
+                    //     cas_store: local_worker_cfg.cas_fast_slow_store,
+                    //     scheduler: "".to_string(), // Unused.
+                    // });
+                    let svc = ExecutionServer::new(&cfg, &action_schedulers, &store_manager)
+                        .err_tip(|| "Could not create Execution service for worker")?
+                        .into_service();
+
+                    let new_local_worker = NewLocalWorker::new(
+                        local_worker_cfg,
+                        auto::Builder::new(TaskExecutor::default()),
+                        svc,
+                    )
+                    .err_tip(|| "Could not create NewLocalWorker")?;
+                    root_futures.push(Box::pin(async move {
+                        let result = new_local_worker.serve().await;
+                        event!(
+                            Level::ERROR,
+                            "NewLocalWorker exited with error: {result:?}",
+                        );
+                        Ok(())
+                    }));
+
                     spawn!("worker", fut, ?name)
                 }
             };

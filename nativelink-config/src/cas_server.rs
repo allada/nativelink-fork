@@ -409,7 +409,7 @@ pub struct ServerConfig {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 pub enum WorkerProperty {
     /// List of static values.
     /// Note: Generally there should only ever be 1 value, but if the platform
@@ -423,7 +423,7 @@ pub enum WorkerProperty {
 }
 
 /// Generic config for an endpoint and associated configs.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// URI of the endpoint.
@@ -502,7 +502,7 @@ pub enum EnvironmentSource {
     action_directory,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UploadActionResultConfig {
     /// Underlying AC store that the worker will use to publish execution results
@@ -562,7 +562,7 @@ pub struct UploadActionResultConfig {
     pub failure_message_template: String,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LocalWorkerConfig {
     /// Name of the worker. This is give a more friendly name to a worker for logging
