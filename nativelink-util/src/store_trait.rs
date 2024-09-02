@@ -308,6 +308,15 @@ impl Hash for StoreKey<'_> {
     }
 }
 
+impl From<StoreKey<'_>> for String {
+    fn from(store_key: StoreKey<'_>) -> Self {
+        match store_key {
+            StoreKey::Str(s) => s.into_owned(),
+            _ => store_key.as_str().into_owned(),
+        }
+    }
+}
+
 impl<'a> From<&'a str> for StoreKey<'a> {
     fn from(s: &'a str) -> Self {
         StoreKey::Str(Cow::Borrowed(s))
