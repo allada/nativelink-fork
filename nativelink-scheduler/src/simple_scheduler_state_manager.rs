@@ -456,14 +456,14 @@ where
                 // action in this case and abort this operation.
                 let err = make_err!(
                     Code::Aborted,
-                    "Worker ids do not match - {:?} != {:?} for {:?}",
+                    "Worker ids do not match - {:?} != {:?} for {:?} update: {update:?}",
                     maybe_worker_id,
                     awaited_action.worker_id(),
                     awaited_action,
                 );
                 event!(
                     Level::INFO,
-                    "Worker ids do not match - {:?} != {:?} for {:?}. This is probably due to another worker picking up the action.",
+                    "Worker ids do not match - {:?} != {:?} for {:?} update: {update:?}. This is probably due to another worker picking up the action.",
                     maybe_worker_id,
                     awaited_action.worker_id(),
                     awaited_action,

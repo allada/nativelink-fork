@@ -79,7 +79,7 @@ const SLASH_SIZE: usize = 1;
 //
 
 // Useful utility struct for converting bazel's (uri-like path) into its parts.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResourceInfo<'a> {
     pub instance_name: Cow<'a, str>,
     pub uuid: Option<Cow<'a, str>>,
