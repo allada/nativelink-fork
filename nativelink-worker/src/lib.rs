@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod local_worker;
+pub mod new_local_worker;
 pub mod running_actions_manager;
 pub mod worker_api_client_wrapper;
 pub mod worker_utils;

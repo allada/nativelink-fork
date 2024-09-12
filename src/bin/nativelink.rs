@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +28,7 @@ use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
-    CasConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, ServerConfig, WorkerConfig,
+    CasConfig, ExecutionConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, ServerConfig, WorkerConfig
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{make_err, Code, Error, ResultExt};
@@ -43,6 +44,7 @@ use nativelink_service::capabilities_server::CapabilitiesServer;
 use nativelink_service::cas_server::CasServer;
 use nativelink_service::execution_server::ExecutionServer;
 use nativelink_service::health_server::HealthServer;
+use nativelink_service::reverse_service::ReverseService;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
@@ -59,6 +61,7 @@ use nativelink_util::store_trait::{
 use nativelink_util::task::TaskExecutor;
 use nativelink_util::{background_spawn, init_tracing, spawn, spawn_blocking};
 use nativelink_worker::local_worker::new_local_worker;
+use nativelink_worker::new_local_worker::NewLocalWorker;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::{Mutex, RwLock};
@@ -74,6 +77,7 @@ use tokio_rustls::rustls::{RootCertStore, ServerConfig as TlsServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Server as TonicServer;
+use tower::Service;
 use tracing::{error_span, event, trace_span, Level};
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -389,6 +393,7 @@ async fn inner_main(
             .add_optional_service(
                 services
                     .worker_api
+                    .clone()
                     .map_or(Ok(None), |cfg| {
                         WorkerApiServer::new(&cfg, &worker_schedulers).map(|v| {
                             let mut service = v.into_service();
@@ -453,6 +458,38 @@ async fn inner_main(
                 &health_cfg.path
             };
             svc = svc.route_service(path, HealthServer::new(health_registry));
+        }
+        if let Some(worker_api_cfg) = &services.worker_api {
+            let v = ReverseService::new(
+                &worker_api_cfg,
+                &worker_schedulers
+            )
+            .unwrap()
+            .into_service();
+            svc = svc.route_service(
+                "/foo",
+                axum::routing::get(move |request: hyper::Request<axum::body::Body>| {
+                    let mut v = v.clone();
+                    async move {
+                        let bbb = v.call(request).await;
+                        match bbb {
+                            Ok(response) => {
+                                // let response = response.into_body();
+                                // let mut response = Response::new(axum::body::Body::new(response));
+                                // *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                // Result::<_, Infallible>::Ok(response)
+                                todo!();
+                            },
+                            Err(e) => {
+                                // let mut response = Response::new(format!("Error: {e:?}").into());
+                                // *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                // Ok(response)
+                                todo!();
+                            }
+                        }
+                    }
+                }),
+            );
         }
 
         if let Some(prometheus_cfg) = services.experimental_prometheus {
@@ -909,7 +946,7 @@ async fn inner_main(
                         fast_slow_store.clone()
                     };
                     let (local_worker, metrics) = new_local_worker(
-                        Arc::new(local_worker_cfg),
+                        Arc::new(local_worker_cfg.clone()),
                         fast_slow_store,
                         maybe_ac_store,
                         historical_store,
@@ -932,6 +969,31 @@ async fn inner_main(
                     worker_metrics.insert(name.clone(), metrics);
                     let fut = Arc::new(OriginContext::new())
                         .wrap_async(trace_span!("worker_ctx"), local_worker.run());
+
+                    let cfg = HashMap::<String, ExecutionConfig>::new();
+                    // cfg.insert("".to_string(), ExecutionConfig {
+                    //     cas_store: local_worker_cfg.cas_fast_slow_store,
+                    //     scheduler: "".to_string(), // Unused.
+                    // });
+                    let svc = ExecutionServer::new(&cfg, &action_schedulers, &store_manager)
+                        .err_tip(|| "Could not create Execution service for worker")?
+                        .into_service();
+
+                    let new_local_worker = NewLocalWorker::new(
+                        local_worker_cfg,
+                        auto::Builder::new(TaskExecutor::default()),
+                        svc,
+                    )
+                    .err_tip(|| "Could not create NewLocalWorker")?;
+                    root_futures.push(Box::pin(async move {
+                        let result = new_local_worker.serve().await;
+                        event!(
+                            Level::ERROR,
+                            "NewLocalWorker exited with error: {result:?}",
+                        );
+                        Ok(())
+                    }));
+
                     spawn!("worker", fut, ?name)
                 }
             };
