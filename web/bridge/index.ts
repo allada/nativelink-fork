@@ -1,3 +1,3 @@
-import { start } from './src';
+import { main } from './src';
 
-start().catch(err => console.error(err));
+main().catch(err => console.error(err));

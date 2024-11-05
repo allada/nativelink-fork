@@ -62,3 +62,35 @@ pub mod google {
         include!("google.rpc.pb.rs");
     }
 }
+pub mod build_event_stream {
+    include!("build_event_stream.pb.rs");
+}
+pub mod command_line {
+    include!("command_line.pb.rs");
+}
+pub mod devtools {
+    pub mod build {
+        pub mod lib {
+            pub mod packages {
+                pub mod metrics {
+                    include!("devtools.build.lib.packages.metrics.pb.rs");
+                }
+            }
+        }
+    }
+}
+pub mod blaze {
+    include!("blaze.pb.rs");
+    pub mod invocation_policy {
+        include!("blaze.invocation_policy.pb.rs");
+    }
+    pub mod strategy_policy {
+        include!("blaze.strategy_policy.pb.rs");
+    }
+}
+pub mod options {
+    include!("options.pb.rs");
+}
+pub mod failure_details {
+    include!("failure_details.pb.rs");
+}

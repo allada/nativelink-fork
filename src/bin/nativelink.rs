@@ -1068,10 +1068,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        let _ = runtime.block_on(Arc::new(OriginContext::new()).wrap_async(
-            trace_span!("main"),
-            inner_main(cfg, server_start_time, shutdown_tx),
-        ));
+        runtime
+            .block_on(Arc::new(OriginContext::new()).wrap_async(
+                trace_span!("main"),
+                inner_main(cfg, server_start_time, shutdown_tx),
+            ))
+            .unwrap();
     }
     Ok(())
 }

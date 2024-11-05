@@ -76,3 +76,12 @@ Make sure to use the right IP, if it's not hosted on `localhost`
 ```bash
 bazel build some-target
 ```
+
+# Protobuf generation
+
+To generate the protobuf files run:
+```sh
+./node_modules/protobufjs-cli/bin/pbjs -t static-module --es6 -w es6 --force-long -p ../../nativelink-proto -o src/protos.js $(find ../../nativelink-proto/ -type f -name '*.proto')
+./node_modules/protobufjs-cli/bin/pbts -o src/types/protos.d.ts src/protos.js
+
+```

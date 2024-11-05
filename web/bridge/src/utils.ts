@@ -1,28 +1,18 @@
-type ParsedMessage = {
-  prefix: string;
-  eventType: string;
-  eventID: string;
-  subEventID: string;
-  sequenceNumber: string;
-}
-
-export function parseMessage(message: string) {
-  const parts = message.split(':');
-  const [prefix, eventType, eventID, subEventID, sequenceNumber] = parts;
-  return {
-    prefix,
-    eventType,
-    eventID,
-    subEventID,
-    sequenceNumber
-  };
-}
-
-export function constructRedisKey(parsedMessage: ParsedMessage) {
-  console.log("\nNew Published Event: ")
-  console.log("  EventID: ", parsedMessage.eventID)
-  console.log("  Sequence Number: ", parsedMessage.sequenceNumber)
-  console.log("  Invocation ID: ", parsedMessage.subEventID)
-  console.log("------------------")
-  return `${parsedMessage.prefix}:${parsedMessage.eventType}:${parsedMessage.eventID}:${parsedMessage.subEventID}:${parsedMessage.sequenceNumber}`;
+export function removeEmptyFields(obj: object): boolean {
+  let hasFields = false;
+  for (const key in obj) {
+    if (obj[key] === null || obj[key] === undefined) {
+      delete obj[key];
+    } else if (typeof obj[key] === 'object') {
+      let foundFields = removeEmptyFields(obj[key]);
+      if (!foundFields) {
+        delete obj[key];
+      } else {
+        hasFields = true;
+      }
+    } else {
+      hasFields = true;
+    }
+  }
+  return hasFields;
 }

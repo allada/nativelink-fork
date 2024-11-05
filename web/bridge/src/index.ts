@@ -1,73 +1,97 @@
-import { initializeRedisClients } from './redis';
-import { initializeProtobuf } from './protobuf';
-import { handleEvent } from './eventHandler';
-import { startWebSocket } from './websocket';
-import { startWebServer } from './http';
+import protobuf from 'protobufjs/minimal';
+import { createClient, commandOptions } from 'redis';
+import pg from 'pg';
 
+import processLifecycleEvent from './transforms/PublishLifecycleEventRequest';
+import processBuildToolEventStream from './transforms/PublishBuildToolEventStreamRequest';
 
-export async function start() {
-  // Base URL
-  const github = "https://raw.githubusercontent.com"
+protobuf.util.toJSONOptions = Object.assign({}, protobuf.util.toJSONOptions, {
+  longs: Number,
+});
 
-  // NativeLink URL
-  const nativelinkRepo = "TraceMachina/nativelink"
-  const nativelinkBranch = "main"
-  const nativelinkProtoPath = `${github}/${nativelinkRepo}/${nativelinkBranch}/nativelink-proto/`;
+type RedisClientType = ReturnType<typeof createClient>;
 
-  // Proto Remote Path
-  const protoRepo = "protocolbuffers/protobuf"
-  const protoBranch = "master"
-  const protoRepoPath = `${github}/${protoRepo}/${protoBranch}/main/src/google/protobuf`;
-  const protoDevToolsPath = `${github}/${protoRepo}/main/src/google/devtools/build/v1`;
+async function initRedisClients(): Promise<RedisClientType> {
+  try {
+    const redisClient  = createClient({
+      url: process.env.REDIS_URL,
+    });
 
-  const googleProto = "googleapis/googleapis"
-  const googleProtoBranch = "master"
-  const googleProtoPath = `${github}/${googleProto}/${googleProtoBranch}/google/devtools/build/v1`;
+    redisClient.on('error', (err) => {
+      console.error('Redis Client Error:', err);
+      throw new Error('Failed to connect to Redis.');
+    });
 
-    // Bazel Remote Path
-  const bazelRepo = "bazelbuild/bazel"
-  const bazelBranch = "master"
-  const bazelProtoPath = `${github}/${bazelRepo}/${bazelBranch}/src/main/java/com/google/devtools/build/lib/buildeventstream/proto`;
+    await redisClient.connect();
 
-  // TODO(SchahinRohani): Add Buck2 Protos for future Buck2 support
-  // Buck2 Protos
-  // const buck2Repo = "facebook/buck2/main"
-  // const buck2Branch = "main"
-  // const buck2ProtoPath = `${github}/${buck2Repo}/${buck2Branch}/app/buck2_data/data.proto`;
+    console.log('Redis clients successfully connected.');
 
-  // Actual using Protos.
-  const PublishBuildEventProto =`${googleProtoPath}/publish_build_event.proto`;
-  const BazelBuildEventStreamProto = `${bazelProtoPath}/build_event_stream.proto`;
+    return redisClient;
+  } catch (error) {
+    console.error('Error during Redis client initialization:', error);
+    throw new Error('Unable to initialize Redis clients. Please check your connection.');
+  }
+}
 
-  const protos = [ PublishBuildEventProto, BazelBuildEventStreamProto ]
-
-  console.info("Link to: \n")
-  console.info("Google Publish Build Events Proto:\n", PublishBuildEventProto, "\n");
-  console.info("Bazel Build Event Stream Proto:\n", BazelBuildEventStreamProto, "\n")
-
-  // Load Remote Bazel Proto Files
-  const protoTypes = await initializeProtobuf(protos)
-
-  const { redisClient, commandClient } = await initializeRedisClients();
-
-  // Subscribe to the build_event channel
-  await redisClient.subscribe(process.env.NATIVELINK_PUB_SUB_CHANNEL || "build_event", async (message: string) => {
-    await handleEvent(message, commandClient, protoTypes);
+async function initPgClient() {
+  const pgClient = new pg.Client({
+    user: process.env.PG_USER,
+    host: process.env.PG_HOST,
+    database: process.env.PG_DATABASE,
+    password: process.env.PG_PASSWORD,
+    port: parseInt(process.env.PG_PORT as string),
   });
 
-  const websocketServer = startWebSocket();
-  const webServer = startWebServer();
+  await pgClient.connect();
 
-  process.on('SIGINT', async () => {
-    await redisClient.disconnect();
-    await commandClient.disconnect();
-    console.info("Received SIGINT. Shutdown gracefully.")
-    process.exit();
-  });
-  process.on('SIGTERM', async () => {
-    await redisClient.disconnect();
-    await commandClient.disconnect();
-    console.info("Received SIGTERM. Shutdown gracefully.")
-    process.exit();
-  });
+  console.log('Postgres client successfully connected.');
+
+  return pgClient;
+}
+
+async function redisScan(redisClient: RedisClientType, match: string, handler: (data: Buffer | null) => Promise<void>) {
+  let cursor = 0;
+  do {
+    const {cursor: newCursor, keys} = await redisClient.scan(cursor, { MATCH: match });
+    cursor = newCursor;
+
+    const dataPromises = keys.map(key => {
+      return redisClient
+        .get(commandOptions({ returnBuffers: true }), key)
+        .then(data => handler(data))
+    });
+    await Promise.all(dataPromises);
+  } while (cursor !== 0);
+}
+
+export async function main() {
+  let [redisClient, pgClient] = await Promise.all([initRedisClients(), initPgClient()]);
+
+  let pubSubClient = redisClient.duplicate();
+  await pubSubClient.connect();
+
+  const ALREADY_RUNNING = { running: false };
+  const maybeRunBepProcessor = async () => {
+    if (ALREADY_RUNNING.running) {
+      return;
+    }
+    ALREADY_RUNNING.running = true;
+    setTimeout(() => {
+      Promise.all([
+        redisScan(redisClient, 'BuildToolEventStream:*', data => processBuildToolEventStream(data, pgClient)),
+        redisScan(redisClient, 'LifecycleEvent:*', data => processLifecycleEvent(data, pgClient)),
+      ])
+      .finally(() => {
+        ALREADY_RUNNING.running = false;
+      });
+    }, 10);
+  };
+  pubSubClient.subscribe(String(process.env.REDIS_SUBSCRIBE_CHANNEL), maybeRunBepProcessor, true);
+  // setInterval(maybeRunBepProcessor, 1000);
+  await Promise.all([
+    redisScan(redisClient, 'BuildToolEventStream:*', data => processBuildToolEventStream(data, pgClient)),
+    redisScan(redisClient, 'LifecycleEvent:*', data => processLifecycleEvent(data, pgClient)),
+  ]);
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  process.exit(0);
 }
