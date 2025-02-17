@@ -9,6 +9,8 @@ nativelink-config = { path = "../nativelink-config" }
 nativelink-util = { path = "../nativelink-util" }
 nativelink-proto = { path = "../nativelink-proto" }
 nativelink-metric = { path = "../nativelink-metric" }
+alloc-bytes = { path = "../external-crates/alloc-bytes" }
+heap-allocator = { path = "../external-crates/heap-allocator", features = ["mutex"] }
 async-lock = { version = "3.4.0", features = ["std"], default-features = false }
 async-trait = "0.1.85"
 aws-config = { version = "1.5.14", default-features = false, features = [
@@ -51,9 +53,11 @@ hyper-rustls = { version = "0.24.2", default-features = false, features = [
   "webpki-roots",
 ] }
 lz4_flex = { version = "0.11.3", default-features = false }
+# memmap2 = { version = "0.9.5", default-features = false }
 parking_lot = "0.12.3"
 prost = { version = "0.13.4", default-features = false }
 rand = { version = "0.8.5", default-features = false }
+rlsf = { version = "0.2.1", default-features = false }
 serde = { version = "1.0.217", default-features = false }
 tokio = { version = "1.43.0", features = ["fs", "rt-multi-thread", "signal", "io-util"], default-features = false }
 tokio-stream = { version = "0.1.17", features = ["fs"], default-features = false }
